@@ -1,0 +1,6 @@
+pyrogram
+tgcrypto
+groq
+google-generativeai
+edge-tts
+Pillow
