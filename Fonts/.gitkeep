@@ -1,0 +1,47 @@
+Fonts/Pyidaungsu-2.5.3_Bold.ttf
+Fonts/Pyidaungsu-2.5.3_Regular.ttf
+Fonts/Pyidaungsu-1.8.3_Bold.ttf
+Fonts/Pyidaungsu-1.8.3_Regular.ttf
+Fonts/Pyidaungsu-1.8.3_Numbers.ttf
+Fonts/NotoSansMyanmar-Regular.ttf
+Fonts/NotoSerifMyanmar-Black.ttf
+Fonts/A13_WenYoe-Regular.ttf
+Fonts/myanmar_font.ttf
+```[span_2](start_span)[span_2](end_span)[span_3](start_span)[span_3](end_span)
+
+---
+
+### ⚠️ အရေးကြီးသော သတိပြုချက် (ဖောင့်များ မပျက်စီးစေရန်)
+
+ဖောင့်ဖိုင်များ (`.ttf`) သည် စာသား (Text) မဟုတ်ဘဲ **Binary ဒေတာများ** ဖြစ်ပါသည်။ ထို့ကြောင့် GitHub ၏ "Create new file" အကွက်ထဲတွင် စာသားအဖြစ် ကော်ပီကူးထည့်ပါက **ဖောင့်များ ပျက်စီးသွားပြီး ဗီဒီယိုတွင် မြန်မာစာတန်းထိုး လုံးဝ ပေါ်လာမည် မဟုတ်ပါ**။
+
+---
+
+### 💡 အလွယ်ဆုံးနှင့် အဆင်ပြေဆုံး ဖြေရှင်းနည်း (Auto-Download)
+
+ဖုန်းထဲကနေ ဖောင့် ၉ ခုကို GitHub ပေါ် Upload တင်ရခက်ခဲနေပါက **GitHub ပေါ် Font တင်စရာ မလိုအောင်** `main.py` ၏ ထိပ်ဆုံးတွင် အောက်ပါ ကုဒ်ကို ထည့်သွင်းထားနိုင်ပါသည်။ 
+
+Bot စတင် Run သည်နှင့် `Fonts/` ဖိုင်တွဲ ရှိ/မရှိ စစ်ဆေးပြီး မရှိပါက အလိုအလျောက် ဒေါင်းလုဒ်ဆွဲကာ နေရာချထားပေးမည့် စနစ် ဖြစ်ပါသည် -
+
+```python
+import os
+import urllib.request
+import zipfile
+
+# Fonts folder မရှိပါက Auto Download လုပ်မည့် စနစ်
+FONTS_DIR = "Fonts"
+if not os.path.exists(FONTS_DIR):
+    os.makedirs(FONTS_DIR, exist_ok=True)
+    print("⏳ မြန်မာဖောင့်များကို အလိုအလျောက် ဒေါင်းလုဒ်ဆွဲနေပါသည်...")
+    # GitHub release သို့မဟုတ် public repository မှ font zip ဒေါင်းလုဒ်ယူခြင်း
+    font_zip_url = "https://github.com/kaung566/burmese-auto6-bot/raw/main/bot_assets.zip"
+    zip_path = "temp_fonts.zip"
+    try:
+        urllib.request.urlretrieve(font_zip_url, zip_path)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(".")
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+        print("✅ ဖောင့်များ အောင်မြင်စွာ တပ်ဆင်ပြီးပါပြီ။")
+    except Exception as e:
+        print(f"Font Auto-download error: {e}")
