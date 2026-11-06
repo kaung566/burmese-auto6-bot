@@ -151,15 +151,16 @@ user_original_intro_mode = {}
 
 class GeminiKeyPool:
     def __init__(self, keys_string: str):
-        self.groq_key = ""
+        self.groq_keys = []
         try:
             payload = json.loads(str(keys_string))
             if isinstance(payload, dict):
+                self.groq_keys = [k.strip() for k in re.split(r"[,\\s]+", str(payload.get("groq", "") or "")) if k.strip()]
                 keys_string = payload.get("gemini", "")
-                self.groq_key = str(payload.get("groq", "") or "").strip()
         except Exception:
             pass
-        self.keys = [k.strip() for k in re.split(r'[, ]+', str(keys_string)) if k.strip()]
+        self.keys = [k.strip() for k in re.split(r"[,\\s]+", str(keys_string)) if k.strip()]
+        self.groq_key = self.groq_keys[0] if self.groq_keys else ""
         if not self.keys:
             self.keys = load_gemini_keys()
         self.lock = threading.Lock()
@@ -281,21 +282,9 @@ for f in set(AVAILABLE_FONTS):
     fam = _register_font(f)
     REGISTERED_FONTS[f] = fam
 
-# Install bundled Fonts/ files into the system font directory when permitted.
-# This also makes them available to FFmpeg/fontconfig after ZIP extraction.
-try:
-    import shutil as _font_shutil
-    _font_source_dir = os.path.join(_script_dir, 'Fonts')
-    _font_system_dir = '/usr/local/share/fonts/truetype/g12bot'
-    if os.path.isdir(_font_source_dir):
-        os.makedirs(_font_system_dir, exist_ok=True)
-        for _font_name in os.listdir(_font_source_dir):
-            if _font_name.lower().endswith(('.ttf', '.otf')):
-                _font_shutil.copy2(os.path.join(_font_source_dir, _font_name), os.path.join(_font_system_dir, _font_name))
-        try: subprocess.run(['fc-cache', '-f', _font_system_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        except Exception: pass
-except Exception as _font_install_error:
-    logging.warning('Bundled font system install skipped: %s', _font_install_error)
+# Fonts are registered directly from the bundled Fonts/ directory with Qt.
+# Do not copy them into /usr/local/share/fonts: hosted containers may be read-only.
+# FFmpeg/ASS uses the bundled font directory explicitly where supported.
 
 DEFAULT_FONT_FILE = AVAILABLE_FONTS[0] if AVAILABLE_FONTS else "Arial"
 DEFAULT_FONT_FAMILY = REGISTERED_FONTS.get(DEFAULT_FONT_FILE, "Arial")
@@ -441,8 +430,20 @@ def extract_audio_ffmpeg(video_path, audio_path):
 def is_youtube_link(url): return bool(re.search(r'(youtube\.com|youtu\.be)', url, re.IGNORECASE))
 
 def download_youtube_video(url, output_path):
-    ydl_opts = {'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', 'outtmpl': output_path, 'quiet': True, 'no_warnings': True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([url])
+    """Fetch a small, low-resolution opening segment for calibration preview only."""
+    ydl_opts = {
+        'format': 'best[height<=480][ext=mp4]/best[height<=480]/best[ext=mp4]/best',
+        'outtmpl': output_path,
+        'quiet': True, 'no_warnings': True,
+        'download_sections': {'*': '0-35'},
+        'force_keyframes_at_cuts': True,
+        'merge_output_format': 'mp4',
+        'retries': 3, 'fragment_retries': 3,
+        'socket_timeout': 20,
+        'concurrent_fragment_downloads': 4,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
 
 def get_media_duration(file_path):
     """Read duration robustly from format or streams (TS chunks may omit format.duration)."""
@@ -1063,9 +1064,10 @@ def split_subtitle_text_chronologically(text, start_t, end_t, max_chars=14, spac
     return result
 
 def sync_call_groq_whisper(audio_path, groq_key):
-    """Groq-hosted Whisper STT with 10-minute chunks for long movie audio."""
-    if not groq_key:
-        raise RuntimeError("Groq API Key မရှိပါ။ /setkey GeminiKey,GroqKey ဖြင့် Groq key ထည့်ပါ။")
+    """Groq-hosted Whisper STT with 10-minute chunks and key failover."""
+    groq_keys = [k.strip() for k in re.split(r"[,\\s]+", str(groq_key or "")) if k.strip()]
+    if not groq_keys:
+        raise RuntimeError("Groq API Key မရှိပါ။ /setkey groq GROQ_KEY1,GROQ_KEY2 ဖြင့် ထည့်ပါ။")
     if not os.path.isfile(audio_path):
         raise RuntimeError("Transcription audio file မတွေ့ပါ။")
     import httpx
@@ -1090,16 +1092,26 @@ def sync_call_groq_whisper(audio_path, groq_key):
                 if os.path.getsize(part_path) > 24 * 1024 * 1024:
                     raise RuntimeError(f"Groq Whisper အပိုင်း {part_no} သည် 24MB ထက်ကြီးနေပါသည်။")
                 print(f"🎙️ Groq Whisper transcription {part_no}/{len(parts)}...", flush=True)
-                with open(part_path, "rb") as audio_file:
-                    response = client.post(
-                        "https://api.groq.com/openai/v1/audio/transcriptions",
-                        headers={"Authorization": f"Bearer {groq_key}"},
-                        files={"file": (os.path.basename(part_path), audio_file, "audio/mpeg")},
-                        data={"model": "whisper-large-v3-turbo", "response_format": "verbose_json",
-                              "timestamp_granularities[]": "segment"},
-                    )
-                if response.status_code != 200:
-                    raise RuntimeError(f"Groq Whisper HTTP {response.status_code}: {response.text[:400]}")
+                response = None
+                last_error = "No Groq keys available"
+                for key_index, candidate_key in enumerate(groq_keys, 1):
+                    with open(part_path, "rb") as audio_file:
+                        response = client.post(
+                            "https://api.groq.com/openai/v1/audio/transcriptions",
+                            headers={"Authorization": f"Bearer {candidate_key}"},
+                            files={"file": (os.path.basename(part_path), audio_file, "audio/mpeg")},
+                            data={"model": "whisper-large-v3-turbo", "response_format": "verbose_json",
+                                  "timestamp_granularities[]": "segment"},
+                        )
+                    if response.status_code == 200:
+                        break
+                    last_error = f"HTTP {response.status_code}: {response.text[:250]}"
+                    # Auth/permission/quota failures move to the next supplied key.
+                    if response.status_code not in (401, 403, 429, 500, 502, 503, 504):
+                        break
+                    print(f"⚠️ Groq key {key_index}/{len(groq_keys)} failed; trying next key...", flush=True)
+                if response is None or response.status_code != 200:
+                    raise RuntimeError(f"Groq Whisper failed with all available keys. Last error: {last_error}")
                 payload = response.json()
                 for seg in payload.get("segments", []) or []:
                     txt = str(seg.get("text", "")).strip()
@@ -1429,7 +1441,7 @@ async def advanced_sync_pipeline(audio_path, gemini_keys_str, input_video, outpu
         await update_status_func("၂။ 🎙️ AI မှ အသံကို စာသားပြောင်းနေပါသည် (Groq Whisper STT)...")
 
     try:
-        response_json = await asyncio.to_thread(sync_call_groq_whisper, audio_path, gemini_pool.groq_key)
+        response_json = await asyncio.to_thread(sync_call_groq_whisper, audio_path, ",".join(gemini_pool.groq_keys))
             
         if "segments" not in response_json or not response_json["segments"]:
             words = response_json.get("text", "").split()
@@ -2440,49 +2452,52 @@ async def admin_stats(event):
         msg += f"**{idx}. {data['name']}**\n   └ 🎬: **{data['count']}** ပုဒ် | 🕒: {data['last_active']}\n"
     await event.respond(msg)
 
-@bot.on(events.NewMessage(pattern="/setkey"))
+@bot.on(events.NewMessage(pattern=r"^/setkey(?:\\s|$)"))
 async def set_user_key(event):
     if not _claim_incoming_event(event): return
     parts = event.text.split(maxsplit=1)
     if len(parts) < 2:
         await event.respond(
-            "🔑 **API Key ထည့်ရန်**\n"
-            "အသုံးပြုနည်း: `/setkey GeminiKey1,GeminiKey2,GroqKey`\n"
-            "Key များကို သိမ်းဆည်းရုံသာ လုပ်ဆောင်ပြီး API စမ်းသပ်ခြင်း မပြုလုပ်ပါ။"
+            "🔑 **API Key များကို သီးခြားထည့်နိုင်ပါသည်**\\n"
+            "Gemini: `/setkey GEMINI_KEY1,GEMINI_KEY2,...`\\n"
+            "Groq: `/setkey groq GROQ_KEY1,GROQ_KEY2,...`\\n"
+            "Key တစ်ခုတည်းလည်း ထည့်နိုင်ပြီး အများဆုံး ၅ ခုအထိ လက်ခံပါသည်။"
         )
         return
 
-    supplied = [item.strip() for item in parts[1].split(",") if item.strip()]
-    gemini_keys = [key for key in supplied if key.startswith(("AIza", "AQ."))]
-    groq_key = next((key for key in supplied if key.startswith("gsk_")), "")
-    if not gemini_keys and not groq_key:
+    payload = parts[1].strip()
+    is_groq_command = payload.lower().startswith("groq ")
+    if is_groq_command:
+        raw_keys = payload[5:].strip()
+        keys = [k.strip() for k in re.split(r"[,\\s]+", raw_keys) if k.strip()]
+        keys = list(dict.fromkeys(k for k in keys if k.startswith("gsk_")))[:5]
+        if not keys:
+            await event.respond("❌ Groq Key မတွေ့ပါ။ `/setkey groq gsk_...,...` ပုံစံသုံးပါ။")
+            return
+        current = user_keys.get(event.sender_id, {"gemini": "", "groq": ""})
+        current_gemini = current.get("gemini", "") if isinstance(current, dict) else str(current)
+        user_keys[event.sender_id] = {"gemini": current_gemini, "groq": ",".join(keys)}
         await event.respond(
-            "❌ Key ပုံစံကို မခွဲခြားနိုင်ပါ။\n"
-            "Gemini Key သည် AIza/AQ. ဖြင့်၊ Groq Key သည် gsk_ ဖြင့် စတင်ရပါမည်။\n"
-            "မှတ်ချက်: API ကို မခေါ်ဘဲ Key ပုံစံကိုသာ စစ်ဆေးပါသည်။"
+            f"✅ Groq API Key {len(keys)} ခု သိမ်းပြီးပါပြီ။\\n"
+            "🔁 တစ်ခု Authentication မအောင်မြင်ပါက နောက် Key ကို အလိုအလျောက် စမ်းသုံးပါမည်။"
         )
         return
 
-    # Save the supplied credentials as-is. Actual authentication/quota errors,
-    # if any, are handled during generation with model fallback.
-    user_keys[event.sender_id] = {
-        "gemini": ",".join(dict.fromkeys(gemini_keys)),
-        "groq": groq_key,
-    }
+    # Gemini keys: comma-separated; accept one through five.
+    keys = [k.strip() for k in re.split(r"[,\\s]+", payload) if k.strip()]
+    keys = list(dict.fromkeys(k for k in keys if k.startswith(("AIza", "AQ."))))[:5]
+    if not keys:
+        await event.respond("❌ Gemini Key မတွေ့ပါ။ `/setkey GEMINI_KEY1,GEMINI_KEY2` ပုံစံသုံးပါ။")
+        return
+    current = user_keys.get(event.sender_id, {"gemini": "", "groq": ""})
+    current_groq = current.get("groq", "") if isinstance(current, dict) else ""
+    user_keys[event.sender_id] = {"gemini": ",".join(keys), "groq": current_groq}
     user_gemini_available_models[event.sender_id] = list(GEMINI_MODEL_CANDIDATES)
     user_gemini_model.setdefault(event.sender_id, "auto")
-
     await event.respond(
-        "✅ **API Key များ သိမ်းဆည်းပြီးပါပြီ။**\n"
-        f"🔹 Gemini Key: **{len(set(gemini_keys))} ခု**\n"
-        f"🔹 Groq: **{'ON' if groq_key else 'OFF'}**\n"
-        "🔹 Gemini Model: **3 ခု အသုံးပြုရန် သတ်မှတ်ထားသည်**\n"
-        "   • Gemini 3.6 Flash\n"
-        "   • Gemini 3.5 Flash\n"
-        "   • Gemini 3.5 Flash-Lite\n"
-        "🔁 Auto Mode သည် Model တစ်ခု မအောင်မြင်ပါက နောက် Model သို့ ပြောင်းသုံးပါမည်။\n"
-        "🔐 Key တန်ဖိုးများကို ပြန်မပြပါ။\n"
-        "ℹ️ API Key ကို အခုအချိန်တွင် စမ်းသပ်မထားပါ။ အလုပ်လုပ်/Quota အခြေအနေကို Generate လုပ်ချိန်တွင်သာ သိနိုင်ပါမည်."
+        f"✅ Gemini API Key {len(keys)} ခု သိမ်းပြီးပါပြီ။\\n"
+        "🔁 Key တစ်ခု quota/auth error ဖြစ်ပါက နောက် Key သို့ အလိုအလျောက် ပြောင်းသုံးပါမည်။\\n"
+        "Groq ထည့်ရန် `/setkey groq GROQ_KEY1,GROQ_KEY2` ကို သီးခြားပို့ပါ။"
     )
 
 @bot.on(events.NewMessage(pattern="/queue"))
@@ -2554,7 +2569,7 @@ async def handle_message(event):
     is_yt = False if is_vid_file else is_youtube_link(url)
     if not is_yt and not is_vid_file: return
 
-    if user_id not in user_keys: await event.respond("🔑 ကျေးဇူးပြု၍ အရင်ဆုံး `/setkey [Gemini_Key]` ဖြင့် Keys များ ထည့်ပေးပါ..."); return
+    if user_id not in user_keys: await event.respond("🔑 ကျေးဇူးပြု၍ အရင်ဆုံး `/setkey GEMINI_KEY1,GEMINI_KEY2` နှင့် `/setkey groq GROQ_KEY1,GROQ_KEY2` ဖြင့် Keys များ ထည့်ပေးပါ..."); return
 
     clean_url = ""
     if is_yt:
@@ -3088,3 +3103,4 @@ try:
     bot.loop.run_until_complete(main())
 except Exception as e:
     print(f"Bot Error: {e}")
+
