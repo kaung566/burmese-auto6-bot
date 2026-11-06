@@ -1,5 +1,5 @@
 # =====================================================================
-# AI MOVIE RECAP BOT - ENGINE v93.0 (GROQ WHISPER + ADVANCED MENU + PERFECT SYNC)
+# SANMA AI MOVIE RECAP BOT - ENGINE v93.0 (ASSEMBLYAI + LOW MEMORY)
 # =====================================================================
 
 import os
@@ -18,34 +18,13 @@ import glob
 import urllib.request
 import random
 import wave
-import numpy as np
+import hashlib
+import shutil
 from typing import List
-from concurrent.futures import ThreadPoolExecutor
 import itertools
 import unicodedata
 
-# =====================================================================
-# 📦 AUTO INSTALLER & IMPORTS
-# =====================================================================
-def auto_install_requirements():
-    try:
-        import telethon
-        import httpx
-        import edge_tts
-        import yt_dlp
-        import nest_asyncio
-        from PyQt5.QtWidgets import QApplication
-        from google import genai
-        import dotenv
-    except ImportError:
-        print("📦 Colab အတွက် လိုအပ်သော Library များ စတင်သွင်းယူနေပါသည် (ခေတ္တစောင့်ပါ)...")
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install", "-q",
-            "telethon", "httpx", "edge-tts", "yt-dlp", "nest_asyncio", "PyQt5", "google-genai", "python-dotenv"
-        ])
-        print("✅ Library များ သွင်းယူပြီးပါပြီ။")
-
-auto_install_requirements()
+# Dependencies are installed by `pip install -r requirements.txt` at deployment time.
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -64,11 +43,24 @@ import edge_tts
 import yt_dlp
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PyQt5.QtWidgets import QApplication
-from PyQt5.QtGui import QImage, QPainter, QFont, QColor, QFontMetrics, QBrush, QPen, QPainterPath, QFontDatabase, QLinearGradient, QPolygonF, QConicalGradient
-from PyQt5.QtCore import Qt, QPointF
+_QT_APP = None
 
-_QT_APP = QApplication.instance() or QApplication(sys.argv)
+def _load_qt():
+    """Load Qt only when a font/title/thumbnail is actually rendered."""
+    global _QT_APP, QApplication, QImage, QPainter, QFont, QColor, QFontMetrics
+    global QBrush, QPen, QPainterPath, QFontDatabase, QLinearGradient, QPolygonF
+    global QConicalGradient, Qt, QPointF
+    if "QImage" not in globals():
+        from PyQt5.QtWidgets import QApplication
+        from PyQt5.QtGui import (QImage, QPainter, QFont, QColor, QFontMetrics, QBrush,
+                                 QPen, QPainterPath, QFontDatabase, QLinearGradient,
+                                 QPolygonF, QConicalGradient)
+        from PyQt5.QtCore import Qt, QPointF
+    if QApplication.instance() is None:
+        _QT_APP = QApplication(sys.argv)
+    else:
+        _QT_APP = QApplication.instance()
+
 nest_asyncio.apply()
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 
@@ -80,10 +72,8 @@ API_HASH = "be0dcb53c69af61e86e74938c9ace4a4"
 
 # Set BOT_TOKEN in environment variables, or enter it when prompted.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
+if not BOT_TOKEN and __name__ == "__main__":
     BOT_TOKEN = input("Telegram Bot Token ထည့်ပါ: ").strip()
-if not BOT_TOKEN:
-    raise SystemExit("❌ Telegram BOT_TOKEN မရှိပါ။")
 
 # License/paid-user verification has been removed; all users can access the bot.
 async def verify_telegram_id(user_id):
@@ -93,6 +83,49 @@ async def verify_telegram_id(user_id):
 # ⚙️ VARIABLES & CACHES 
 # =====================================================================
 user_keys = {}
+# AssemblyAI credentials are persisted separately for each Telegram user.
+ASSEMBLYAI_KEYS_FILE = os.getenv("ASSEMBLYAI_KEYS_FILE", "data/assemblyai_user_keys.json")
+assemblyai_user_keys = {}
+
+def _load_assemblyai_user_keys():
+    try:
+        with open(ASSEMBLYAI_KEYS_FILE, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, dict):
+            return {str(uid): str(key) for uid, key in payload.items()
+                    if str(uid).isdigit() and isinstance(key, str) and key.strip()}
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logging.warning("AssemblyAI key store could not be loaded: %s", type(exc).__name__)
+    return {}
+
+def _save_assemblyai_user_keys():
+    directory = os.path.dirname(os.path.abspath(ASSEMBLYAI_KEYS_FILE))
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = ASSEMBLYAI_KEYS_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(assemblyai_user_keys, handle, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.chmod(tmp_path, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp_path, ASSEMBLYAI_KEYS_FILE)
+    try:
+        os.chmod(ASSEMBLYAI_KEYS_FILE, 0o600)
+    except OSError:
+        pass
+
+def parse_assemblyai_key_command(text_value):
+    parts = str(text_value or "").strip().split(maxsplit=2)
+    if len(parts) != 3 or parts[0].lower() != "/setkey" or parts[1].lower() != "assemblyai":
+        return None
+    key = parts[2].strip()
+    return key if len(key) >= 12 and not any(ch.isspace() for ch in key) else None
+
+assemblyai_user_keys = _load_assemblyai_user_keys()
 user_voices, user_speeds, user_stats, job_logs = {}, {}, {}, []
 user_platform, user_res, user_sub_mode, user_sub_color = {}, {}, {}, {}
 user_title_mode, user_blur_mode, user_blur_y, user_sub_y = {}, {}, {}, {}
@@ -130,13 +163,79 @@ _START_DEBOUNCE_SECONDS = 2.0
 user_queues = {}
 user_queue_active = {}
 # Accept many users into per-user queues, but run only a safe number of full
-# video jobs at once. Override with MAX_CONCURRENT_JOBS=2 on a larger host.
-try:
-    MAX_CONCURRENT_JOBS = max(1, min(4, int(os.getenv("MAX_CONCURRENT_JOBS", "1"))))
-except (TypeError, ValueError):
-    MAX_CONCURRENT_JOBS = 1
-GLOBAL_JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
-GLOBAL_RENDER_LOCK = asyncio.Semaphore(2)
+# video jobs at once. This build fixes concurrency at one for the 256MB target.
+# Low-memory profile: one full job and one FFmpeg render at a time.
+MAX_CONCURRENT_JOBS = 1
+GLOBAL_JOB_SEMAPHORE = asyncio.Semaphore(1)
+GLOBAL_RENDER_LOCK = asyncio.Semaphore(1)
+
+def _read_process_memory_mb():
+    try:
+        with open("/proc/self/status", "r", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return None
+
+def _log_memory(stage):
+    rss = _read_process_memory_mb()
+    container_usage = None
+    container_limit = None
+    try:
+        with open("/sys/fs/cgroup/memory.current", "r", encoding="ascii") as handle:
+            container_usage = int(handle.read().strip()) / (1024.0 * 1024.0)
+        with open("/sys/fs/cgroup/memory.max", "r", encoding="ascii") as handle:
+            raw_limit = handle.read().strip()
+            if raw_limit != "max":
+                container_limit = int(raw_limit) / (1024.0 * 1024.0)
+    except Exception:
+        pass
+    if rss is not None and container_usage is not None:
+        logging.info("RAM monitor | %s | RSS %.1f MB | cgroup %.1f MB%s",
+                     stage, rss, container_usage,
+                     f"/{container_limit:.0f} MB" if container_limit is not None else "")
+    elif rss is not None:
+        logging.info("RAM monitor | %s | RSS %.1f MB", stage, rss)
+    return rss
+
+def _cleanup_old_temp_files(max_age_hours=24):
+    cutoff = time.time() - max_age_hours * 3600
+    try:
+        for name in os.listdir("temp"):
+            path = os.path.join("temp", name)
+            if name == "tts_cache" or name.startswith(("logo_", "bgm_")):
+                continue
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+def _cleanup_user_job_files(user_id, started_at):
+    patterns = (
+        f"out_{user_id}_*", f"extract_{user_id}_*", f"chunk_audio_{user_id}_*",
+        f"chunk_vid_{user_id}_*", f"list_{user_id}_*", f"merge_temp_{user_id}_*",
+        f"watermarked_{user_id}_*", f"subjob_{user_id}_*",
+    )
+    for pattern in patterns:
+        for path in glob.glob(os.path.join("temp", pattern)):
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) >= started_at:
+                    os.remove(path)
+                elif os.path.isdir(path) and os.path.getmtime(path) >= started_at:
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                pass
+
+os.makedirs("temp/tts_cache", exist_ok=True)
+_cleanup_old_temp_files()
 CURRENT_ACTIVE_USER = ""
 ADMIN_ID = API_ID
 
@@ -254,10 +353,13 @@ download_required_fonts()
 def _register_font(font_path):
     try:
         if os.path.exists(font_path):
+            _load_qt()
             font_id = QFontDatabase.addApplicationFont(font_path)
             families = QFontDatabase.applicationFontFamilies(font_id)
-            if families: return families[0]
-    except Exception: pass
+            if families:
+                return families[0]
+    except Exception:
+        pass
     return "Arial"
 
 AVAILABLE_FONTS = []
@@ -277,20 +379,21 @@ if not AVAILABLE_FONTS:
     _script_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else '/content'
     _LOCAL_FONT = os.path.join(_script_dir, "font.ttf")
     if os.path.exists(_LOCAL_FONT): AVAILABLE_FONTS.append(_LOCAL_FONT)
-# Register bundled fonts from ZIP; keep all bundled font files available to the app.
-for f in set(AVAILABLE_FONTS):
-    fam = _register_font(f)
-    REGISTERED_FONTS[f] = fam
+# Keep font paths indexed but defer Qt font registration until rendering needs a font.
+# This avoids loading Qt's GUI runtime while the bot is idle on small-memory hosting.
+REGISTERED_FONTS = {}
 
 # Fonts are registered directly from the bundled Fonts/ directory with Qt.
 # Do not copy them into /usr/local/share/fonts: hosted containers may be read-only.
 # FFmpeg/ASS uses the bundled font directory explicitly where supported.
 
 DEFAULT_FONT_FILE = AVAILABLE_FONTS[0] if AVAILABLE_FONTS else "Arial"
-DEFAULT_FONT_FAMILY = REGISTERED_FONTS.get(DEFAULT_FONT_FILE, "Arial")
+DEFAULT_FONT_FAMILY = "Arial"
 
 def get_font_for_language(user_id, lang_code):
     ffile = user_font.get(user_id, DEFAULT_FONT_FILE)
+    if ffile not in REGISTERED_FONTS:
+        REGISTERED_FONTS[ffile] = _register_font(ffile)
     return REGISTERED_FONTS.get(ffile, DEFAULT_FONT_FAMILY)
 
 # =====================================================================
@@ -417,11 +520,31 @@ def run_health_check_server():
         else: raise e
 
 def run_ffmpeg(cmd, label="ffmpeg"):
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # Limit FFmpeg thread pools and avoid buffering stdout on small hosts.
+    cmd = list(cmd)
+    if cmd and os.path.basename(str(cmd[0])).lower().startswith("ffmpeg"):
+        cmd = [cmd[0], "-hide_banner", "-loglevel", "error",
+               "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1"] + cmd[1:]
+    _log_memory(f"before {label}")
+    _monitor_stop = threading.Event()
+    def _monitor_ffmpeg_ram():
+        while not _monitor_stop.wait(2.0):
+            _log_memory(f"{label} running")
+    _monitor_thread = threading.Thread(target=_monitor_ffmpeg_ram, name="sanma-ram-monitor", daemon=True)
+    _monitor_thread.start()
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                text=True, errors="replace", close_fds=True)
+    except MemoryError as exc:
+        raise RuntimeError(f"RAM မလုံလောက်ပါ။ FFmpeg အဆင့် [{label}] ကို ရပ်လိုက်ပါသည်။") from exc
+    finally:
+        _monitor_stop.set()
+        _monitor_thread.join(timeout=0.25)
     if result.returncode != 0:
         tail = (result.stderr or "").strip()
         tail = tail[-800:] if len(tail) > 800 else tail
         raise RuntimeError(f"FFmpeg Error [{label}] (exit {result.returncode}):\n{tail}")
+    _log_memory(f"after {label}")
     return result
 
 def extract_audio_ffmpeg(video_path, audio_path):
@@ -440,7 +563,7 @@ def download_youtube_video(url, output_path):
         'merge_output_format': 'mp4',
         'retries': 3, 'fragment_retries': 3,
         'socket_timeout': 20,
-        'concurrent_fragment_downloads': 4,
+        'concurrent_fragment_downloads': 1,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -546,6 +669,28 @@ def get_blur_mask_filter(current_video_label="[0:v]", y_position_percent=82, bor
     filter_string += f"[blur_crop]crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale=iw/4:ih/4,boxblur=5:2,scale=iw*4:ih*4:flags=fast_bilinear[blurred_bot];"
     filter_string += f"[orig_for_blur][blurred_bot]overlay={overlay_x}:{overlay_y}[vid_sub_blurred]"
     return filter_string, "[vid_sub_blurred]"
+
+def extract_preview_clip(video_path, out_path, platform="yt", percent=0.30, seconds=4.0):
+    """Create a tiny 360p/15fps calibration clip using FFmpeg streaming filters."""
+    if platform == "tt":
+        width, height = 360, 640
+    elif platform == "fb":
+        width, height = 360, 360
+    else:
+        width, height = 640, 360
+    try:
+        duration = get_media_duration(video_path)
+    except Exception:
+        duration = seconds + 1.0
+    start = max(0.0, min(duration - seconds, duration * float(percent) - seconds / 2.0))
+    vf = (f"fps=15,scale={width}:{height}:force_original_aspect_ratio=decrease,"
+          f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p")
+    run_ffmpeg([
+        "ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", video_path, "-t", str(seconds),
+        "-an", "-vf", vf, "-r", "15", "-c:v", "libx264", "-preset", "ultrafast",
+        "-crf", "32", "-threads", "1", "-movflags", "+faststart", out_path
+    ], label="low_memory_preview_clip")
+    return out_path
 
 def extract_preview_frame(video_path, out_path, dim_w, dim_h, percent=0.3):
     dim_w = int(dim_w); dim_w = dim_w if dim_w % 2 == 0 else dim_w + 1
@@ -769,6 +914,7 @@ def _try_generate_ai_poster(video_path, out_path, api_keys):
 
 def create_thumbnail(video_path, title_text, out_path, font_fam, w=960, h=1706, platform="yt", highlight_time=None, gemini_keys=""):
     """AI-assisted cinematic vertical poster: dominant hero on right, story scene on left, Burmese title panel bottom-left."""
+    _load_qt()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     bg_path = f"temp/tb_bg_{int(time.time()*1000)}.jpg"
     # AI-ONLY mode: the poster background must be generated by Gemini from two
@@ -898,7 +1044,7 @@ def build_complete_timeline(segments_data, total_duration, max_dur=20.0, max_gap
     if not segments_data: return [{"start": 0.0, "end": total_duration, "text": "", "is_speech": False}]
     
     merged_speech = []
-    curr_text = ""
+    curr_text = str(segments_data[0].get("text", "")).strip()
     curr_start = float(segments_data[0]["start"])
     curr_end = float(segments_data[0]["end"])
     
@@ -1063,69 +1209,121 @@ def split_subtitle_text_chronologically(text, start_t, end_t, max_chars=14, spac
         cursor = c_end
     return result
 
-def sync_call_groq_whisper(audio_path, groq_key):
-    """Groq-hosted Whisper STT with 10-minute chunks and key failover."""
-    groq_keys = [k.strip() for k in re.split(r"[,\s]+", str(groq_key or "")) if k.strip()]
-    if not groq_keys:
-        raise RuntimeError("Groq API Key မရှိပါ။ /setkey groq GROQ_KEY1,GROQ_KEY2 ဖြင့် ထည့်ပါ။")
+def _assemblyai_safe_error(message, api_key=""):
+    value = str(message or "")
+    if api_key:
+        value = value.replace(api_key, "[REDACTED]")
+    value = re.sub(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,]+", r"\1[REDACTED]", value)
+    return value[:500]
+
+def _assemblyai_request_with_retry(client, method, url, api_key, **kwargs):
+    retry_statuses = {408, 425, 429, 500, 502, 503, 504}
+    delays = (1.0, 2.0, 4.0)
+    last_error = None
+    for attempt in range(4):
+        try:
+            response = client.request(method, url, **kwargs)
+            if response.status_code < 400:
+                return response
+            body = _assemblyai_safe_error(response.text, api_key)
+            last_error = RuntimeError(f"AssemblyAI HTTP {response.status_code}: {body}")
+            if response.status_code not in retry_statuses or attempt == 3:
+                raise last_error
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            last_error = RuntimeError(f"AssemblyAI network/timeout error: {type(exc).__name__}")
+            if attempt == 3:
+                raise last_error from exc
+        if attempt < 3:
+            time.sleep(delays[attempt])
+    raise last_error or RuntimeError("AssemblyAI request မအောင်မြင်ပါ။")
+
+def assemblyai_words_to_segments(words):
+    """Convert AssemblyAI millisecond word timings into the bot's seconds timeline."""
+    result = []
+    for word in words or []:
+        try:
+            start_ms, end_ms = word.get("start"), word.get("end")
+            text_value = str(word.get("text") or "").strip()
+            if start_ms is None or end_ms is None or not text_value:
+                continue
+            start_s = max(0.0, float(start_ms) / 1000.0)
+            end_s = max(start_s, float(end_ms) / 1000.0)
+            if end_s <= start_s:
+                continue
+            result.append({"start": start_s, "end": end_s, "text": text_value, "is_speech": True})
+        except (TypeError, ValueError):
+            continue
+    return result
+
+def sync_call_assemblyai(audio_path, assemblyai_key):
+    """Stream audio to AssemblyAI v2, request Universal-2 and poll to completion."""
+    key = str(assemblyai_key or "").strip()
+    if not key:
+        raise RuntimeError("AssemblyAI API Key မရှိပါ။ /setkey assemblyai YOUR_API_KEY ဖြင့် အရင်ထည့်ပါ။")
     if not os.path.isfile(audio_path):
         raise RuntimeError("Transcription audio file မတွေ့ပါ။")
-    import httpx
-    import tempfile
-    work_dir = tempfile.mkdtemp(prefix="groq_whisper_")
-    pattern = os.path.join(work_dir, "part_%03d.mp3")
-    split = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", audio_path,
-         "-f", "segment", "-segment_time", "600", "-reset_timestamps", "1",
-         "-c:a", "libmp3lame", "-b:a", "48k", "-ar", "16000", "-ac", "1", pattern],
-        capture_output=True, text=True
-    )
-    if split.returncode != 0:
-        raise RuntimeError("Groq Whisper အတွက် audio ခွဲမရပါ: " + split.stderr[-400:])
-    parts = sorted(glob.glob(os.path.join(work_dir, "part_*.mp3")))
-    if not parts:
-        raise RuntimeError("Groq Whisper audio အပိုင်း မတွေ့ပါ။")
-    all_segments, all_text, offset = [], [], 0.0
+    if os.path.getsize(audio_path) <= 0:
+        raise RuntimeError("Transcription audio file အလွတ်ဖြစ်နေပါသည်။")
+
+    headers = {"authorization": key}
+    upload_url = "https://api.assemblyai.com/v2/upload"
+    transcript_url = "https://api.assemblyai.com/v2/transcript"
+    timeout = httpx.Timeout(connect=30.0, read=180.0, write=180.0, pool=30.0)
+    poll_timeout = max(900, int(os.getenv("ASSEMBLYAI_POLL_TIMEOUT_SECONDS", "14400")))
+    poll_interval = max(2.0, float(os.getenv("ASSEMBLYAI_POLL_INTERVAL_SECONDS", "5")))
+    started = time.monotonic()
+
     try:
-        with httpx.Client(timeout=240.0) as client:
-            for part_no, part_path in enumerate(parts, 1):
-                if os.path.getsize(part_path) > 24 * 1024 * 1024:
-                    raise RuntimeError(f"Groq Whisper အပိုင်း {part_no} သည် 24MB ထက်ကြီးနေပါသည်။")
-                print(f"🎙️ Groq Whisper transcription {part_no}/{len(parts)}...", flush=True)
-                response = None
-                last_error = "No Groq keys available"
-                for key_index, candidate_key in enumerate(groq_keys, 1):
-                    with open(part_path, "rb") as audio_file:
-                        response = client.post(
-                            "https://api.groq.com/openai/v1/audio/transcriptions",
-                            headers={"Authorization": f"Bearer {candidate_key}"},
-                            files={"file": (os.path.basename(part_path), audio_file, "audio/mpeg")},
-                            data={"model": "whisper-large-v3-turbo", "response_format": "verbose_json",
-                                  "timestamp_granularities[]": "segment"},
-                        )
-                    if response.status_code == 200:
-                        break
-                    last_error = f"HTTP {response.status_code}: {response.text[:250]}"
-                    # Auth/permission/quota failures move to the next supplied key.
-                    if response.status_code not in (401, 403, 429, 500, 502, 503, 504):
-                        break
-                    print(f"⚠️ Groq key {key_index}/{len(groq_keys)} failed; trying next key...", flush=True)
-                if response is None or response.status_code != 200:
-                    raise RuntimeError(f"Groq Whisper failed with all available keys. Last error: {last_error}")
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            # File object body is streamed by httpx; no whole-file read into RAM.
+            with open(audio_path, "rb") as audio_file:
+                upload_response = _assemblyai_request_with_retry(
+                    client, "POST", upload_url, key,
+                    headers={**headers, "content-type": "application/octet-stream"},
+                    content=audio_file,
+                )
+            audio_url = str(upload_response.json().get("upload_url") or "").strip()
+            if not audio_url:
+                raise RuntimeError("AssemblyAI Upload API မှ upload_url မရရှိပါ။")
+
+            create_response = _assemblyai_request_with_retry(
+                client, "POST", transcript_url, key,
+                headers={**headers, "content-type": "application/json"},
+                json={"audio_url": audio_url, "speech_model": "universal-2", "language_detection": True},
+            )
+            transcript_id = str(create_response.json().get("id") or "").strip()
+            if not transcript_id:
+                raise RuntimeError("AssemblyAI Transcript Create API မှ ID မရရှိပါ။")
+
+            status_url = f"{transcript_url}/{transcript_id}"
+            while True:
+                if time.monotonic() - started > poll_timeout:
+                    raise RuntimeError("AssemblyAI Transcription Timeout ဖြစ်နေပါသည်။ နောက်မှ ပြန်စမ်းပါ။")
+                response = _assemblyai_request_with_retry(
+                    client, "GET", status_url, key, headers=headers
+                )
                 payload = response.json()
-                for seg in payload.get("segments", []) or []:
-                    txt = str(seg.get("text", "")).strip()
-                    if txt:
-                        all_segments.append({"start": offset + float(seg.get("start", 0)),
-                                             "end": offset + float(seg.get("end", 0)), "text": txt})
-                txt_all = str(payload.get("text", "")).strip()
-                if txt_all: all_text.append(txt_all)
-                offset += awaitless_media_duration(part_path)
-    finally:
-        import shutil as _shutil
-        _shutil.rmtree(work_dir, ignore_errors=True)
-    print(f"✅ Groq Whisper completed: {len(all_segments)} segments", flush=True)
-    return {"segments": all_segments, "text": " ".join(all_text), "duration": offset}
+                status = str(payload.get("status") or "").lower()
+                if status == "completed":
+                    segments = assemblyai_words_to_segments(payload.get("words") or [])
+                    return {
+                        "segments": segments,
+                        "text": str(payload.get("text") or " ".join(s["text"] for s in segments)),
+                        "duration": float(payload.get("audio_duration") or (segments[-1]["end"] if segments else 0.0)),
+                    }
+                if status == "error":
+                    detail = _assemblyai_safe_error(payload.get("error") or "Unknown transcription error", key)
+                    raise RuntimeError(f"AssemblyAI Transcription မအောင်မြင်ပါ: {detail}")
+                if status not in {"queued", "processing"}:
+                    raise RuntimeError(f"AssemblyAI မှ မသိသော Status ပြန်လာပါသည်: {status or 'empty'}")
+                time.sleep(poll_interval)
+    except MemoryError as exc:
+        raise RuntimeError("RAM မလုံလောက်သဖြင့် AssemblyAI STT ကို ရပ်လိုက်ပါသည်။") from exc
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"AssemblyAI HTTP Error: {type(exc).__name__}") from exc
+    except (ValueError, KeyError) as exc:
+        raise RuntimeError(f"AssemblyAI Response ကို ဖတ်မရပါ: {type(exc).__name__}") from exc
+
 
 def awaitless_media_duration(path):
     try:
@@ -1214,17 +1412,15 @@ def process_single_chunk(args):
         return (idx, None, 0.0)
 
 async def run_all_chunks(args_list, progress_callback=None):
-    sem = asyncio.Semaphore(2)
-    async def _one(args):
-        async with sem:
-            return await asyncio.to_thread(process_single_chunk, args)
-    tasks = [asyncio.create_task(_one(args)) for args in args_list]
+    # Process exactly one FFmpeg chunk at a time to bound decoded-frame buffers.
     results = []
-    total = max(1, len(tasks))
-    done = 0
-    for task in asyncio.as_completed(tasks):
-        results.append(await task)
-        done += 1
+    total = max(1, len(args_list))
+    for done, args in enumerate(args_list, 1):
+        try:
+            result = await asyncio.to_thread(process_single_chunk, args)
+        except MemoryError as exc:
+            raise RuntimeError("RAM မလုံလောက်ပါ။ Render ကို ခေတ္တရပ်လိုက်ပါသည်။") from exc
+        results.append(result)
         if progress_callback:
             await progress_callback(done, total)
     return sorted(results, key=lambda x: x[0])
@@ -1413,6 +1609,31 @@ async def generate_gap_recap_narration(timeline_data, speech_indices, translated
                 continue
     return {}
 
+
+def _tts_cache_path(text_value, voice, rate, pitch):
+    digest = hashlib.sha256(
+        (str(text_value) + "\0" + str(voice) + "\0" + str(rate) + "\0" + str(pitch)).encode("utf-8")
+    ).hexdigest()
+    return os.path.join("temp", "tts_cache", digest + ".mp3")
+
+def _prune_tts_cache(max_bytes=96 * 1024 * 1024):
+    cache_dir = os.path.join("temp", "tts_cache")
+    try:
+        entries = [(os.path.getatime(p), os.path.getsize(p), p)
+                   for p in glob.glob(os.path.join(cache_dir, "*.mp3")) if os.path.isfile(p)]
+        total = sum(item[1] for item in entries)
+        for _, size, path in sorted(entries):
+            if total <= max_bytes:
+                break
+            try:
+                os.remove(path)
+                total -= size
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 async def advanced_sync_pipeline(audio_path, gemini_keys_str, input_video, output_video_path, voice_config, user_speed_val, user_id, update_status_func=None):
     gemini_pool = GeminiKeyPool(gemini_keys_str)
     gemini_pool.preferred_model = user_gemini_model.get(user_id, "auto")
@@ -1437,22 +1658,28 @@ async def advanced_sync_pipeline(audio_path, gemini_keys_str, input_video, outpu
     is_prog_bar = user_progressbar.get(user_id, False)
     v_type = user_video_type.get(user_id, "movie")
 
-    if update_status_func: 
-        await update_status_func("၂။ 🎙️ AI မှ အသံကို စာသားပြောင်းနေပါသည် (Groq Whisper STT)...")
+    if update_status_func:
+        await update_status_func("၂။ 🎙️ AssemblyAI Universal-2 ဖြင့် အသံကို စာသားပြောင်းနေပါသည်...")
 
+    assemblyai_key = assemblyai_user_keys.get(str(user_id), "")
+    if not assemblyai_key:
+        raise RuntimeError("AssemblyAI API Key မထည့်ရသေးပါ။ /setkey assemblyai YOUR_API_KEY ဖြင့် အရင်ထည့်ပါ။")
     try:
-        response_json = await asyncio.to_thread(sync_call_groq_whisper, audio_path, ",".join(gemini_pool.groq_keys))
-            
-        if "segments" not in response_json or not response_json["segments"]:
-            words = response_json.get("text", "").split()
+        response_json = await asyncio.to_thread(sync_call_assemblyai, audio_path, assemblyai_key)
+        if not response_json.get("segments"):
+            words = str(response_json.get("text") or "").split()
             if words:
-                word_dur = response_json.get("duration", total_video_duration) / len(words)
-                raw_segments = [{"start": i * word_dur, "end": (i + 1) * word_dur, "text": word} for i, word in enumerate(words)]
-            else: raw_segments = []
-        else: raw_segments = response_json.get("segments", [])
-    except Exception as e: raise Exception(f"Groq Whisper STT Error: {str(e)}")
+                word_dur = float(response_json.get("duration") or total_video_duration) / len(words)
+                raw_segments = [{"start": i * word_dur, "end": (i + 1) * word_dur,
+                                 "text": word, "is_speech": True} for i, word in enumerate(words)]
+            else:
+                raw_segments = []
+        else:
+            raw_segments = response_json.get("segments", [])
+    except Exception as e:
+        raise RuntimeError(f"AssemblyAI STT Error: {str(e)[:400]}") from e
 
-    # Hybrid mode must still render a video when Whisper finds no dialogue:
+    # Hybrid mode must still render a video when AssemblyAI finds no dialogue:
     # in that case there is no recap narration to insert, so preserve source audio.
     hybrid_mode_requested = user_original_intro_mode.get(user_id, True)
     if not raw_segments and not hybrid_mode_requested:
@@ -1652,7 +1879,7 @@ async def advanced_sync_pipeline(audio_path, gemini_keys_str, input_video, outpu
     translated_dict_secondary = {}
     hybrid_original_dialogue = user_original_intro_mode.get(user_id, True)
     # Subtitle translation is intentionally skipped. If subtitles are enabled,
-    # show the original Whisper transcript only; do not make extra Gemini calls.
+    # show the original AssemblyAI transcript only; do not make extra Gemini calls.
     original_dialogue_subtitles = {
         idx: str(timeline_data[idx].get("text", "")).strip()
         for idx in speech_indices if str(timeline_data[idx].get("text", "")).strip()
@@ -1667,7 +1894,7 @@ async def advanced_sync_pipeline(audio_path, gemini_keys_str, input_video, outpu
     if update_status_func: 
         await update_status_func("၄။ 🗣️ နောက်ခံအသံများ ထုတ်လုပ်နေပါသည် (TTS Engine)...")
 
-    audio_files_map = {}; tts_semaphore = asyncio.Semaphore(8); selected_rate = voice_config.get("rate", "+15%")
+    audio_files_map = {}; tts_semaphore = asyncio.Semaphore(1); selected_rate = voice_config.get("rate", "+15%")
     audio_routing_plan = build_audio_routing_plan(timeline_data, translated_dict, hybrid_original_dialogue)
 
     async def _extract_original_audio_chunk(idx, seg, path):
@@ -1716,19 +1943,28 @@ async def advanced_sync_pipeline(audio_path, gemini_keys_str, input_video, outpu
                 if voice_config["gender"] == "male": c_voice = "my-MM-NilarNeural"; c_pitch = "+5Hz"
                 else: c_voice = "my-MM-ThihaNeural"; c_pitch = "-5Hz"
         
+        cache_path = _tts_cache_path(clean_text, c_voice, selected_rate, c_pitch)
         async with tts_semaphore:
-            rendered = False
-            for attempt in range(3):
+            if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 500:
+                await asyncio.to_thread(shutil.copyfile, cache_path, path)
+            else:
+                rendered = False
+                for attempt in range(3):
+                    try:
+                        await edge_tts.Communicate(text=clean_text, voice=c_voice, rate=selected_rate, pitch=c_pitch).save(path)
+                        if os.path.exists(path) and os.path.getsize(path) > 500:
+                            rendered = True
+                            break
+                    except Exception:
+                        await asyncio.sleep(1.0)
+                if not rendered:
+                    raise RuntimeError(f"Edge TTS chunk {idx} မအောင်မြင်ပါ။ အသံအလွတ်ဖြင့် အစားမထိုးဘဲ ရပ်လိုက်ပါသည်။")
+                await asyncio.to_thread(add_natural_sentence_pause, path, 0.16)
                 try:
-                    await edge_tts.Communicate(text=clean_text, voice=c_voice, rate=selected_rate, pitch=c_pitch).save(path)
-                    if os.path.exists(path) and os.path.getsize(path) > 500:
-                        rendered = True
-                        break
-                except Exception:
-                    await asyncio.sleep(1.0)
-            if not rendered:
-                raise RuntimeError(f"Edge TTS chunk {idx} မအောင်မြင်ပါ။ အသံအလွတ်ဖြင့် အစားမထိုးဘဲ ရပ်လိုက်ပါသည်။")
-            await asyncio.to_thread(add_natural_sentence_pause, path, 0.16)
+                    await asyncio.to_thread(shutil.copyfile, path, cache_path)
+                    await asyncio.to_thread(_prune_tts_cache)
+                except OSError:
+                    logging.warning("TTS cache write skipped; current job continues.")
             audio_files_map[idx] = path
 
     _audio_total = max(1, len(timeline_data))
@@ -1747,7 +1983,9 @@ async def advanced_sync_pipeline(audio_path, gemini_keys_str, input_video, outpu
             pct = int(_audio_completed * 100 / _audio_total)
             await update_status_func(f"PROGRESS|Audio|{pct}|အသံအပိုင်း {_audio_completed}/{_audio_total} ပြီးပါပြီ")
 
-    await asyncio.gather(*[_tracked_audio_chunk(idx, seg) for idx, seg in enumerate(timeline_data)])
+    # Sequential TTS generation caps task count and peak memory on small hosting.
+    for idx, seg in enumerate(timeline_data):
+        await _tracked_audio_chunk(idx, seg)
 
     if update_status_func: 
         await update_status_func("၅။ 🎬 ဗီဒီယိုနှင့် အသံကို ပေါင်းစပ်နေပါသည် (FFmpeg Synchronization & Rendering)...")
@@ -1838,6 +2076,7 @@ async def advanced_sync_pipeline(audio_path, gemini_keys_str, input_video, outpu
 
     title_path = None
     if user_title_mode.get(user_id, True) and story_title and story_title.strip():
+        _load_qt()
         title_path = os.path.join(job_dir, f"title_{user_id}.png")
         title_img = QImage(dim_w, dim_h, QImage.Format_ARGB32); title_img.fill(Qt.transparent); _t_painter = QPainter(title_img)
         try:
@@ -1919,11 +2158,11 @@ async def advanced_sync_pipeline(audio_path, gemini_keys_str, input_video, outpu
     # labels such as [0:v] are valid only for outputs created inside filter_complex.
     video_map_out = cur_label if cur_label != "[0:v]" else "0:v:0"
     # Do not use -shortest; audio is already padded/trimmed to the measured video duration.
-    await asyncio.to_thread(run_ffmpeg, ['ffmpeg', '-y'] + inputs + ['-t', f"{merged_dur:.3f}", '-filter_complex', ";".join(filter_parts), '-map', video_map_out, '-map', audio_map_out] + meta_flags + ['-fflags', '+bitexact'] + video_encoder_args(preset='medium', quality=28) + ['-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k', watermarked_temp], label="final_render")
+    await asyncio.to_thread(run_ffmpeg, ['ffmpeg', '-y'] + inputs + ['-t', f"{merged_dur:.3f}", '-filter_complex', ";".join(filter_parts), '-map', video_map_out, '-map', audio_map_out] + meta_flags + ['-fflags', '+bitexact'] + video_encoder_args(preset='ultrafast', quality=28) + ['-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k', watermarked_temp], label="final_render")
 
     speed_multiplier = SPEED_MULTIPLIERS.get(user_speed_val, 1.0)
     if abs(speed_multiplier - 1.0) > 0.001:
-        await asyncio.to_thread(run_ffmpeg, ['ffmpeg', '-y', '-i', watermarked_temp, '-filter_complex', f"[0:v]setpts={1.0 / speed_multiplier:.4f}*PTS[v];[0:a]atempo={speed_multiplier:.3f}[a]", '-map', '[v]', '-map', '[a]'] + meta_flags + ['-fflags', '+bitexact'] + video_encoder_args(preset='medium', quality=28) + ['-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k', '-ar', '44100', '-ac', '2', output_video_path], label="final_speed_adjust")
+        await asyncio.to_thread(run_ffmpeg, ['ffmpeg', '-y', '-i', watermarked_temp, '-filter_complex', f"[0:v]setpts={1.0 / speed_multiplier:.4f}*PTS[v];[0:a]atempo={speed_multiplier:.3f}[a]", '-map', '[v]', '-map', '[a]'] + meta_flags + ['-fflags', '+bitexact'] + video_encoder_args(preset='ultrafast', quality=28) + ['-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k', '-ar', '44100', '-ac', '2', output_video_path], label="final_speed_adjust")
         if os.path.exists(watermarked_temp): os.remove(watermarked_temp)
     else: os.replace(watermarked_temp, output_video_path)
 
@@ -2460,12 +2699,38 @@ async def set_user_key(event):
         await event.respond(
             "🔑 **API Key များကို သီးခြားထည့်နိုင်ပါသည်**\n"
             "Gemini: `/setkey GEMINI_KEY1,GEMINI_KEY2,...`\n"
-            "Groq: `/setkey groq GROQ_KEY1,GROQ_KEY2,...`\n"
+            "AssemblyAI: `/setkey assemblyai YOUR_API_KEY`\n"
+            "Groq (Gemini Translation Fallback): `/setkey groq GROQ_KEY1,GROQ_KEY2,...`\n"
             "Key တစ်ခုတည်းလည်း ထည့်နိုင်ပြီး အများဆုံး ၅ ခုအထိ လက်ခံပါသည်။"
         )
         return
 
     payload = parts[1].strip()
+    if payload.lower().startswith("assemblyai "):
+        key = parse_assemblyai_key_command(event.text)
+        if not key:
+            await event.respond("❌ AssemblyAI API Key ပုံစံမမှန်ပါ။ `/setkey assemblyai YOUR_API_KEY` ဖြင့် ပြန်ထည့်ပါ။")
+            return
+        uid = str(event.sender_id)
+        previous = assemblyai_user_keys.get(uid)
+        assemblyai_user_keys[uid] = key
+        try:
+            await asyncio.to_thread(_save_assemblyai_user_keys)
+        except Exception as save_err:
+            if previous is None:
+                assemblyai_user_keys.pop(uid, None)
+            else:
+                assemblyai_user_keys[uid] = previous
+            logging.error("AssemblyAI key persistence failed: %s", type(save_err).__name__)
+            await event.respond("❌ API Key ကို လုံခြုံစွာ သိမ်းမရပါ။ Hosting ရဲ့ writable persistent storage ကို စစ်ဆေးပါ။")
+            return
+        # Best-effort deletion prevents the raw secret remaining visible in chat history.
+        try:
+            await event.delete()
+        except Exception:
+            pass
+        await event.respond("✅ AssemblyAI API Key ကို သင့် Telegram User အတွက် သီးခြားလုံခြုံစွာ သိမ်းပြီးပါပြီ။")
+        return
     is_groq_command = payload.lower().startswith("groq ")
     if is_groq_command:
         raw_keys = payload[5:].strip()
@@ -2514,7 +2779,7 @@ async def reset_queue_cmd(event):
         return
     global CURRENT_ACTIVE_USER, GLOBAL_RENDER_LOCK
     CURRENT_ACTIVE_USER = ""
-    GLOBAL_RENDER_LOCK = asyncio.Semaphore(2)
+    GLOBAL_RENDER_LOCK = asyncio.Semaphore(1)
     for uid in user_queues:
         while not user_queues[uid].empty():
             try: user_queues[uid].get_nowait()
@@ -2525,7 +2790,7 @@ async def reset_queue_cmd(event):
 # Global duplicate-update guard used by every incoming message handler.
 # It prevents duplicate processing within this Python process.
 _HANDLED_INCOMING_EVENTS = set()
-_HANDLED_INCOMING_EVENTS_MAX = 10000
+_HANDLED_INCOMING_EVENTS_MAX = 2048
 
 def _claim_incoming_event(event):
     try:
@@ -2569,7 +2834,12 @@ async def handle_message(event):
     is_yt = False if is_vid_file else is_youtube_link(url)
     if not is_yt and not is_vid_file: return
 
-    if user_id not in user_keys: await event.respond("🔑 ကျေးဇူးပြု၍ အရင်ဆုံး `/setkey GEMINI_KEY1,GEMINI_KEY2` နှင့် `/setkey groq GROQ_KEY1,GROQ_KEY2` ဖြင့် Keys များ ထည့်ပေးပါ..."); return
+    if user_id not in user_keys:
+        await event.respond("🔑 Gemini API Key မထည့်ရသေးပါ။ `/setkey GEMINI_KEY1,GEMINI_KEY2` ဖြင့် အရင်ထည့်ပါ။")
+        return
+    if not assemblyai_user_keys.get(str(user_id)):
+        await event.respond("🔑 AssemblyAI API Key မထည့်ရသေးပါ။ `/setkey assemblyai YOUR_API_KEY` ဖြင့် အရင်ထည့်ပါ။")
+        return
 
     clean_url = ""
     if is_yt:
@@ -2618,8 +2888,14 @@ async def start_position_calibration(event, user_id, url, is_yt):
             await event.respond(f"📥 **Auto-Queue** ထဲသို့ ထည့်သွင်းလိုက်ပါပြီ (နောက်ထပ် **{pending}** ခု စောင့်ဆိုင်းနေပါသည်)။")
         return
 
-    p_form = user_platform.get(user_id, "yt"); p_res = user_res.get(user_id, "720")
-    dim_w, dim_h = get_video_dimensions(p_form, p_res)
+    p_form = user_platform.get(user_id, "yt")
+    # Calibration frame preview is capped to 360p regardless of final output setting.
+    if p_form == "tt":
+        dim_w, dim_h = 360, 640
+    elif p_form == "fb":
+        dim_w, dim_h = 360, 360
+    else:
+        dim_w, dim_h = 640, 360
     raw_frame = f"temp/frame_{user_id}.jpg"
     user_preview_percent[user_id] = 0.30
     try: await asyncio.to_thread(extract_preview_frame, input_video, raw_frame, dim_w, dim_h, percent=user_preview_percent[user_id])
@@ -2633,6 +2909,24 @@ async def start_position_calibration(event, user_id, url, is_yt):
     if user_id not in user_sub_y: user_sub_y[user_id] = 82
 
     user_pending_calib[user_id] = {"input_video": input_video, "url": url, "is_yt": is_yt, "orig_event": event}
+    # Send a short 360p/15fps clip preview, then retain the original still-frame
+    # calibration image and buttons for precise blur/subtitle positioning.
+    preview_clip = f"temp/preview_{user_id}_{time.time_ns()}.mp4"
+    try:
+        await asyncio.to_thread(
+            extract_preview_clip, input_video, preview_clip,
+            user_platform.get(user_id, "yt"), user_preview_percent[user_id], 4.0
+        )
+        if os.path.isfile(preview_clip) and os.path.getsize(preview_clip) > 1000:
+            await bot.send_file(event.chat_id, preview_clip, caption="🎞️ 360p · 15 FPS Preview")
+    except Exception as preview_err:
+        logging.warning("Low-memory video preview skipped: %s", type(preview_err).__name__)
+    finally:
+        try:
+            if os.path.exists(preview_clip):
+                os.remove(preview_clip)
+        except OSError:
+            pass
     try: await status.delete()
     except Exception: pass
     await send_calibration_preview(event.chat_id, user_id)
@@ -2694,8 +2988,13 @@ async def change_preview_frame(event, delta):
         current = user_preview_percent.get(uid, 0.30) * dur
         target = max(0.3, min(max(0.3, dur - 0.3), current + delta))
         user_preview_percent[uid] = target / max(dur, 0.3)
-        p_form = user_platform.get(uid, "yt"); p_res = user_res.get(uid, "720")
-        dim_w, dim_h = get_video_dimensions(p_form, p_res)
+        p_form = user_platform.get(uid, "yt")
+        if p_form == "tt":
+            dim_w, dim_h = 360, 640
+        elif p_form == "fb":
+            dim_w, dim_h = 360, 360
+        else:
+            dim_w, dim_h = 640, 360
         await asyncio.to_thread(extract_preview_frame, video, f"temp/frame_{uid}.jpg", dim_w, dim_h, percent=user_preview_percent[uid])
         await update_calibration_preview(event)
     except Exception as e:
@@ -2798,6 +3097,12 @@ async def calib_confirm(event):
     await event.answer("✅ Queue ထဲ ထည့်နေပါသည်...")
     try: await event.delete()
     except Exception: pass
+    for preview_file in (f"temp/frame_{uid}.jpg", f"temp/calib_preview_{uid}.jpg"):
+        try:
+            if os.path.exists(preview_file):
+                os.remove(preview_file)
+        except OSError:
+            pass
 
     if uid not in user_queues: user_queues[uid] = asyncio.Queue()
     await user_queues[uid].put({"orig_event": calib["orig_event"], "input_video": calib["input_video"]})
@@ -2811,8 +3116,9 @@ async def calib_confirm(event):
 async def calib_cancel(event):
     uid = event.sender_id; calib = user_pending_calib.pop(uid, None)
     if calib and os.path.exists(calib["input_video"]): os.remove(calib["input_video"])
-    frame_path = f"temp/frame_{uid}.jpg"
-    if os.path.exists(frame_path): os.remove(frame_path)
+    for frame_path in (f"temp/frame_{uid}.jpg", f"temp/calib_preview_{uid}.jpg"):
+        if os.path.exists(frame_path):
+            os.remove(frame_path)
     try: await event.edit(text="❌ ပယ်ဖျက်လိုက်ပါပြီ။", buttons=None)
     except MessageNotModifiedError: pass
     await event.answer()
@@ -2828,6 +3134,8 @@ def apply_original_intro_audio(original_video, rendered_video, user_id):
 
 async def process_recap_job(job_item, user_id):
     global CURRENT_ACTIVE_USER
+    job_started_at = time.time()
+    _log_memory("job start")
     event = job_item["orig_event"]; input_video = job_item["input_video"]
     sender = await event.get_sender()
     sender_name = getattr(sender, 'first_name', '') or getattr(sender, 'username', '') or f"User_{user_id}"
@@ -2915,7 +3223,7 @@ async def process_recap_job(job_item, user_id):
         low = msg.lower()
         if "ဗီဒီယိုမှ အသံ" in msg or "extract audio" in low or "extracting audio" in low:
             await _set_stage("Video", "ဗီဒီယိုကို လက်ခံပြီး Audio ခွဲထုတ်နေသည်...")
-        elif "stable whisper" in low or "transcrib" in low or "ဘာသာပြန်" in msg or "script" in low:
+        elif "assemblyai" in low or "transcrib" in low or "ဘာသာပြန်" in msg or "script" in low:
             await _set_stage("AI Script", "စာသားပြင်ဆင်နေသည်...")
         elif "tts engine" in low or "voice" in low or "အသံများ ထုတ်လုပ်" in msg or "အသံ (audio)" in msg:
             await _set_stage("Audio", "AI Voice အသံထုတ်နေသည်...")
@@ -3029,12 +3337,30 @@ async def process_recap_job(job_item, user_id):
         except Exception: pass
 
         if os.path.exists(input_video): os.remove(input_video)
+        _log_memory("job complete")
+    except MemoryError:
+        try:
+            await status.edit("❌ RAM မလုံလောက်ပါ။ Hosting Memory Limit ကြောင့် လက်ရှိ Video ကို မပြီးဆုံးနိုင်ပါ။")
+        except Exception:
+            pass
     except Exception as e:
         # Keep the error in the existing status message; do not send a second copy.
         try: await status.edit(f"❌ Error: {str(e)}")
         except Exception as edit_err: logging.warning(f"Could not edit status message to show error: {edit_err}")
         if os.path.exists(input_video): os.remove(input_video)
         if os.path.exists(extracted_audio_path): os.remove(extracted_audio_path)
+    finally:
+        for transient_path in (input_video, extracted_audio_path, output_video):
+            try:
+                if transient_path and os.path.isfile(transient_path):
+                    os.remove(transient_path)
+            except OSError:
+                pass
+        try:
+            _cleanup_user_job_files(user_id, job_started_at)
+        except Exception as cleanup_err:
+            logging.warning("Temporary cleanup warning: %s", type(cleanup_err).__name__)
+        _log_memory("job cleanup")
 
 async def auto_recap_worker(user_id):
     queue = user_queues[user_id]
@@ -3042,7 +3368,7 @@ async def auto_recap_worker(user_id):
         while not queue.empty():
             job_item = await queue.get()
             try:
-                # The global slot covers extraction, Groq/Gemini, TTS, FFmpeg
+                # The global slot covers extraction, AssemblyAI/Gemini, TTS, FFmpeg
                 # rendering and Telegram upload—not just the final render.
                 if GLOBAL_JOB_SEMAPHORE.locked():
                     try:
@@ -3068,6 +3394,8 @@ async def auto_recap_worker(user_id):
             asyncio.create_task(auto_recap_worker(user_id))
 
 async def main():
+    _cleanup_old_temp_files()
+    _log_memory("bot startup")
     # Process-level lock: prevents two copies of this script in the same runtime
     # from both answering Telegram updates. Separate Colab runtimes must still be stopped manually.
     try:
@@ -3099,7 +3427,11 @@ async def main():
     logging.info("✅ Bot started successfully.")
     await bot.run_until_disconnected()
 
-try:
-    bot.loop.run_until_complete(main())
-except Exception as e:
-    print(f"Bot Error: {e}")
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        raise SystemExit("❌ BOT_TOKEN မရှိပါ။ FadeHost Environment Variables တွင် BOT_TOKEN ထည့်ပါ။")
+    try:
+        bot.loop.run_until_complete(main())
+    except Exception as e:
+        logging.exception("Bot startup/runtime error: %s", type(e).__name__)
+        print(f"Bot Error: {type(e).__name__}: {str(e)[:300]}")
