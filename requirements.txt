@@ -1,62 +1,9 @@
-SANMA MOVIE RECAP BOT — GROQ WHISPER / EDGE TTS BUILD
-====================================================
-
-WHAT CHANGED
-------------
-1. Removed VoxCPM2 and every Voice Clone workflow (commands, upload button,
-   reference-audio storage, clone test path, and clone-only generation code).
-2. Removed the MP3 Sample upload button from Settings.
-3. Speech-to-text now uses Groq Whisper API (whisper-large-v3-turbo).
-4. Long source audio is split into 10-minute MP3 parts, transcribed separately,
-   and timestamps are shifted back into the original movie timeline.
-5. Groq API key is supplied through the existing /setkey command.
-6. Replaced the 14 voice display names with the exact 14 Burmese names supplied.
-7. Kept the existing menu, video processing, subtitles, Gemini recap, Edge TTS,
-   rendering and other existing options as far as possible.
-
-API KEY SETUP
--------------
-In Telegram, send:
-/setkey Gemini_API_Key,Groq_API_Key
-
-Groq keys start with gsk_. Keep keys private. Do not commit them to GitHub.
-For FadeHost, BOT_TOKEN belongs in the app's Environment settings, not in code.
-
-GITHUB + FADEHOST DEPLOY
-------------------------
-1. Create a PRIVATE GitHub repository and upload the contents of this ZIP to
-   the repository root (main_script.py, requirements.txt, Procfile, Fonts/ etc.).
-2. In FadeHost, open Apps > Host an app > Telegram bot (or Something else).
-3. Connect GitHub and select that repository and its main branch.
-4. Set Start command to: python main_script.py
-5. Add Environment variable BOT_TOKEN with the BotFather token.
-6. Deploy, then read the live console for missing system packages or runtime
-   errors. Every push to the connected branch triggers a new deploy.
-
-IMPORTANT FADEHOST LIMITS
--------------------------
-This bot performs FFmpeg video decoding/encoding and Qt-based image/subtitle
-rendering. It needs the ffmpeg and ffprobe system binaries. The Python
-requirements file cannot install those OS binaries. If FadeHost's selected
-runtime does not already provide ffmpeg/ffprobe, use a paid Dockerfile-capable
-plan and add an OS-level FFmpeg install to the image, or use a host that allows
-system packages. The free 256 MB tier is not suitable for reliable video
-rendering; use at least a 1 GB app and test with a short video first.
-
-Groq Whisper handles transcription remotely, so no local Whisper model or
-CUDA GPU is required. Video rendering itself still consumes CPU, RAM and disk.
-
-FILES
------
-main_script.py       Main Telegram bot
-requirements.txt     Python dependencies
-Procfile             Worker start command
-runtime.txt          Python runtime selection
-.env.example         Environment variable example (no real secrets)
-Fonts/               Original bundled fonts
-
-SECURITY
---------
-Never upload .env, Telegram bot tokens, Gemini keys or Groq keys to GitHub.
-If a token has ever been exposed, revoke it with BotFather and create a new one.
-
+telethon>=1.36.0
+httpx>=0.27.0
+edge-tts>=6.1.0
+yt-dlp>=2025.1.15
+nest-asyncio>=1.6.0
+PyQt5>=5.15.11
+google-genai>=1.0.0
+python-dotenv>=1.0.1
+numpy>=1.26.0
