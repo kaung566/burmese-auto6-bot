@@ -129,6 +129,13 @@ _START_DEBOUNCE_SECONDS = 2.0
 
 user_queues = {}
 user_queue_active = {}
+# Accept many users into per-user queues, but run only a safe number of full
+# video jobs at once. Override with MAX_CONCURRENT_JOBS=2 on a larger host.
+try:
+    MAX_CONCURRENT_JOBS = max(1, min(4, int(os.getenv("MAX_CONCURRENT_JOBS", "1"))))
+except (TypeError, ValueError):
+    MAX_CONCURRENT_JOBS = 1
+GLOBAL_JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 GLOBAL_RENDER_LOCK = asyncio.Semaphore(2)
 CURRENT_ACTIVE_USER = ""
 ADMIN_ID = API_ID
@@ -2560,7 +2567,7 @@ async def handle_message(event):
 
 async def start_position_calibration(event, user_id, url, is_yt):
     status = await event.respond("📥 Preview အတွက် Video ကို ရယူနေပါသည်...")
-    input_video = f"temp/calib_{user_id}_{int(time.time())}.mp4"
+    input_video = f"temp/calib_{user_id}_{time.time_ns()}.mp4"
     try:
         if is_yt: await asyncio.to_thread(download_youtube_video, url, input_video)
         else: await event.download_media(file=input_video)
@@ -3019,12 +3026,24 @@ async def auto_recap_worker(user_id):
     try:
         while not queue.empty():
             job_item = await queue.get()
-            try: await process_recap_job(job_item, user_id)
+            try:
+                # The global slot covers extraction, Groq/Gemini, TTS, FFmpeg
+                # rendering and Telegram upload—not just the final render.
+                if GLOBAL_JOB_SEMAPHORE.locked():
+                    try:
+                        await job_item["orig_event"].respond(
+                            f"⏳ Global Queue ထဲတွင် စောင့်ဆိုင်းနေပါသည်။ တစ်ချိန်တည်း အလုပ်လုပ်နိုင်သူ {MAX_CONCURRENT_JOBS} ဦးသာရှိပြီး သင့်အလုပ်ကို အလိုအလျောက် စတင်ပေးပါမည်။"
+                        )
+                    except Exception:
+                        pass
+                async with GLOBAL_JOB_SEMAPHORE:
+                    await process_recap_job(job_item, user_id)
             except Exception as e:
                 logging.error(f"Job failed for user {user_id}: {e}")
                 try: await job_item["orig_event"].respond(f"❌ အလုပ်မအောင်မြင်ပါ: {str(e)[:200]}")
                 except: pass
-            finally: queue.task_done()
+            finally:
+                queue.task_done()
     except Exception as e: logging.error(f"Worker crashed for user {user_id}: {e}")
     finally:
         user_queue_active[user_id] = False
