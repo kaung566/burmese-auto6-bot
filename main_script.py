@@ -155,11 +155,11 @@ class GeminiKeyPool:
         try:
             payload = json.loads(str(keys_string))
             if isinstance(payload, dict):
-                self.groq_keys = [k.strip() for k in re.split(r"[,\\s]+", str(payload.get("groq", "") or "")) if k.strip()]
+                self.groq_keys = [k.strip() for k in re.split(r"[,\s]+", str(payload.get("groq", "") or "")) if k.strip()]
                 keys_string = payload.get("gemini", "")
         except Exception:
             pass
-        self.keys = [k.strip() for k in re.split(r"[,\\s]+", str(keys_string)) if k.strip()]
+        self.keys = [k.strip() for k in re.split(r"[,\s]+", str(keys_string)) if k.strip()]
         self.groq_key = self.groq_keys[0] if self.groq_keys else ""
         if not self.keys:
             self.keys = load_gemini_keys()
@@ -1065,7 +1065,7 @@ def split_subtitle_text_chronologically(text, start_t, end_t, max_chars=14, spac
 
 def sync_call_groq_whisper(audio_path, groq_key):
     """Groq-hosted Whisper STT with 10-minute chunks and key failover."""
-    groq_keys = [k.strip() for k in re.split(r"[,\\s]+", str(groq_key or "")) if k.strip()]
+    groq_keys = [k.strip() for k in re.split(r"[,\s]+", str(groq_key or "")) if k.strip()]
     if not groq_keys:
         raise RuntimeError("Groq API Key မရှိပါ။ /setkey groq GROQ_KEY1,GROQ_KEY2 ဖြင့် ထည့်ပါ။")
     if not os.path.isfile(audio_path):
@@ -2452,15 +2452,15 @@ async def admin_stats(event):
         msg += f"**{idx}. {data['name']}**\n   └ 🎬: **{data['count']}** ပုဒ် | 🕒: {data['last_active']}\n"
     await event.respond(msg)
 
-@bot.on(events.NewMessage(pattern=r"^/setkey(?:\\s|$)"))
+@bot.on(events.NewMessage(pattern=r"^/setkey(?:\s|$)"))
 async def set_user_key(event):
     if not _claim_incoming_event(event): return
     parts = event.text.split(maxsplit=1)
     if len(parts) < 2:
         await event.respond(
-            "🔑 **API Key များကို သီးခြားထည့်နိုင်ပါသည်**\\n"
-            "Gemini: `/setkey GEMINI_KEY1,GEMINI_KEY2,...`\\n"
-            "Groq: `/setkey groq GROQ_KEY1,GROQ_KEY2,...`\\n"
+            "🔑 **API Key များကို သီးခြားထည့်နိုင်ပါသည်**\n"
+            "Gemini: `/setkey GEMINI_KEY1,GEMINI_KEY2,...`\n"
+            "Groq: `/setkey groq GROQ_KEY1,GROQ_KEY2,...`\n"
             "Key တစ်ခုတည်းလည်း ထည့်နိုင်ပြီး အများဆုံး ၅ ခုအထိ လက်ခံပါသည်။"
         )
         return
@@ -2469,7 +2469,7 @@ async def set_user_key(event):
     is_groq_command = payload.lower().startswith("groq ")
     if is_groq_command:
         raw_keys = payload[5:].strip()
-        keys = [k.strip() for k in re.split(r"[,\\s]+", raw_keys) if k.strip()]
+        keys = [k.strip() for k in re.split(r"[,\s]+", raw_keys) if k.strip()]
         keys = list(dict.fromkeys(k for k in keys if k.startswith("gsk_")))[:5]
         if not keys:
             await event.respond("❌ Groq Key မတွေ့ပါ။ `/setkey groq gsk_...,...` ပုံစံသုံးပါ။")
@@ -2478,13 +2478,13 @@ async def set_user_key(event):
         current_gemini = current.get("gemini", "") if isinstance(current, dict) else str(current)
         user_keys[event.sender_id] = {"gemini": current_gemini, "groq": ",".join(keys)}
         await event.respond(
-            f"✅ Groq API Key {len(keys)} ခု သိမ်းပြီးပါပြီ။\\n"
+            f"✅ Groq API Key {len(keys)} ခု သိမ်းပြီးပါပြီ။\n"
             "🔁 တစ်ခု Authentication မအောင်မြင်ပါက နောက် Key ကို အလိုအလျောက် စမ်းသုံးပါမည်။"
         )
         return
 
     # Gemini keys: comma-separated; accept one through five.
-    keys = [k.strip() for k in re.split(r"[,\\s]+", payload) if k.strip()]
+    keys = [k.strip() for k in re.split(r"[,\s]+", payload) if k.strip()]
     keys = list(dict.fromkeys(k for k in keys if k.startswith(("AIza", "AQ."))))[:5]
     if not keys:
         await event.respond("❌ Gemini Key မတွေ့ပါ။ `/setkey GEMINI_KEY1,GEMINI_KEY2` ပုံစံသုံးပါ။")
@@ -2495,8 +2495,8 @@ async def set_user_key(event):
     user_gemini_available_models[event.sender_id] = list(GEMINI_MODEL_CANDIDATES)
     user_gemini_model.setdefault(event.sender_id, "auto")
     await event.respond(
-        f"✅ Gemini API Key {len(keys)} ခု သိမ်းပြီးပါပြီ။\\n"
-        "🔁 Key တစ်ခု quota/auth error ဖြစ်ပါက နောက် Key သို့ အလိုအလျောက် ပြောင်းသုံးပါမည်။\\n"
+        f"✅ Gemini API Key {len(keys)} ခု သိမ်းပြီးပါပြီ။\n"
+        "🔁 Key တစ်ခု quota/auth error ဖြစ်ပါက နောက် Key သို့ အလိုအလျောက် ပြောင်းသုံးပါမည်။\n"
         "Groq ထည့်ရန် `/setkey groq GROQ_KEY1,GROQ_KEY2` ကို သီးခြားပို့ပါ။"
     )
 
@@ -3103,4 +3103,3 @@ try:
     bot.loop.run_until_complete(main())
 except Exception as e:
     print(f"Bot Error: {e}")
-
